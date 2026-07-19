@@ -32,8 +32,6 @@ local cfg = {
     fadeTime = 3.0,
     thickness = 2.0,
     segments = 5,            -- Lowered default from 25 to 5 for major rendering speedup
-    gridSize = 64,           -- Spatial partitioning size
-    cacheRefreshRate = 10,   -- Cache lifetime in seconds
 }
 
 -- =====================================================================
@@ -55,17 +53,7 @@ local camera = getActiveCamera()
 -- UPVALUES FOR DYNAMIC AMMO TRACKING
 local lastAmmoValue = nil
 
--- =====================================================================
--- 3. MatchaRaycast - Restored Original Performant Raycasting Library
--- =====================================================================
-local Raycaster = {}
-Raycaster.__index = Raycaster
-
-local GRID_SIZE = 64
-local CACHE_REFRESH_RATE = 10
-local DEFAULT_MAX_DISTANCE = math.huge
-local MAX_EFFECTIVE_DISTANCE = 10000  -- Safety cap configured to 10000
-
+-- Base Part Class validation helper
 local BASE_PART_CLASSES = {
     Part = true,
     MeshPart = true,
@@ -78,348 +66,30 @@ local BASE_PART_CLASSES = {
     VehicleSeat = true,
 }
 
-local Cache = {
-    entries = {},
-    grid = {},
-    globalEntries = {},       -- Partitioned array for massive map boundaries and baseplates
-    lastBuild = 0,
-    isBuilding = false,
-    activeThread = nil,
-}
-
-local function cellKey(cx, cy, cz)
-    return cx * 73856093 + cy * 19349663 + cz * 83492791
-end
-
-local function worldToCell(x, y, z, cellSize)
-    return math.floor(x / cellSize), math.floor(y / cellSize), math.floor(z / cellSize)
-end
-
-local function buildCache()
-    if Cache.isBuilding then return end
-    Cache.isBuilding = true
-    Cache.activeThread = coroutine.running()
+-- =====================================================================
+-- 3. LINE CLIPPING ALGORITHM
+-- =====================================================================
+-- Finds the exact 3D point on the screen edge where the tracer crosses the viewport boundary
+local function getClippedPoint(pOn, pOff)
+    local low = 0
+    local high = 1
+    local bestP = pOn
+    local bestSP = nil
     
-    -- Write to temporary buffers so the old cache remains readable while we build
-    local entries = {}
-    local grid = {}
-    local globalEntries = {}
-    local cellSize = GRID_SIZE
-    
-    local descendants = workspace:GetDescendants()
-    local totalDescendants = #descendants
-    
-    for i = 1, totalDescendants do
-        -- Pause every 150 parts to allow the game engine to render without stutters
-        if i % 150 == 0 then
-            task.wait()
-        end
-        
-        local child = descendants[i]
-        if child and BASE_PART_CLASSES[child.ClassName] then
-            local cf = child.CFrame
-            local sz = child.Size
-            
-            if cf and sz then
-                local pos = child.Position
-                local radius = sz.Magnitude * 0.5
-                
-                local entry = {
-                    instance = child,
-                    address = child.Address,
-                    cframe = cf,
-                    size = sz,
-                    posX = pos.X,
-                    posY = pos.Y,
-                    posZ = pos.Z,
-                    radius = radius,
-                }
-                
-                entries[#entries + 1] = entry
-                
-                local minX, minY, minZ = worldToCell(pos.X - radius, pos.Y - radius, pos.Z - radius, cellSize)
-                local maxX, maxY, maxZ = worldToCell(pos.X + radius, pos.Y + radius, pos.Z + radius, cellSize)
-                
-                local spanX = maxX - minX
-                local spanY = maxY - minY
-                local spanZ = maxZ - minZ
-                
-                -- Global Object Partitioning: Avoid flooding cells with massive objects (Overflow Protection)
-                if spanX > 3 or spanY > 3 or spanZ > 3 then
-                    globalEntries[#globalEntries + 1] = entry
-                else
-                    for cx = minX, maxX do
-                        for cy = minY, maxY do
-                            for cz = minZ, maxZ do
-                                local key = cellKey(cx, cy, cz)
-                                local bucket = grid[key]
-                                if not bucket then
-                                    bucket = {}
-                                    grid[key] = bucket
-                                end
-                                bucket[#bucket + 1] = entry
-                            end
-                        end
-                    end
-                end
-            end
+    for i = 1, 5 do
+        local mid = (low + high) * 0.5
+        local p_mid = pOn:Lerp(pOff, mid)
+        local sp, onScreen = MatchaWorldToScreen(p_mid)
+        if onScreen then
+            bestP = p_mid
+            bestSP = sp
+            low = mid
+        else
+            high = mid
         end
     end
-    
-    -- Atomic swap to prevent nil/incomplete states during raycast execution
-    Cache.entries = entries
-    Cache.grid = grid
-    Cache.globalEntries = globalEntries
-    Cache.lastBuild = tick()
-    Cache.isBuilding = false
-    Cache.activeThread = nil
-    
-    print("loaded")
+    return bestSP or MatchaWorldToScreen(bestP)
 end
-
-local function ensureCache()
-    if #Cache.entries == 0 or (CACHE_REFRESH_RATE > 0 and tick() - Cache.lastBuild > CACHE_REFRESH_RATE) then
-        if not Cache.isBuilding then
-            -- Run the builder in a background thread
-            task.spawn(buildCache)
-        end
-    end
-end
-
-local function rayIntersectOBB(origin, direction, cframe, size)
-    local localOrigin = cframe:PointToObjectSpace(origin)
-    local localDir = cframe:VectorToObjectSpace(direction)
-
-    local halfX = size.X * 0.5
-    local halfY = size.Y * 0.5
-    local halfZ = size.Z * 0.5
-    
-    local tMin = -math.huge
-    local tMax = math.huge
-    local hitAxis = 1
-    local hitSign = 1
-
-    -- X axis slab
-    local o, d, hs = localOrigin.X, localDir.X, halfX
-    if math.abs(d) < 1e-8 then
-        if o < -hs or o > hs then return nil end
-    else
-        local t1 = (-hs - o) / d
-        local t2 = (hs - o) / d
-        local sign = -1
-        if t1 > t2 then t1, t2 = t2, t1; sign = 1 end
-        if t1 > tMin then tMin = t1; hitAxis = 1; hitSign = sign end
-        if t2 < tMax then tMax = t2 end
-        if tMin > tMax then return nil end
-    end
-    
-    -- Y axis slab
-    o, d, hs = localOrigin.Y, localDir.Y, halfY
-    if math.abs(d) < 1e-8 then
-        if o < -hs or o > hs then return nil end
-    else
-        local t1 = (-hs - o) / d
-        local t2 = (hs - o) / d
-        local sign = -1
-        if t1 > t2 then t1, t2 = t2, t1; sign = 1 end
-        if t1 > tMin then tMin = t1; hitAxis = 2; hitSign = sign end
-        if t2 < tMax then tMax = t2 end
-        if tMin > tMax then return nil end
-    end
-    
-    -- Z axis slab
-    o, d, hs = localOrigin.Z, localDir.Z, halfZ
-    if math.abs(d) < 1e-8 then
-        if o < -hs or o > hs then return nil end
-    else
-        local t1 = (-hs - o) / d
-        local t2 = (hs - o) / d
-        local sign = -1
-        if t1 > t2 then t1, t2 = t2, t1; sign = 1 end
-        if t1 > tMin then tMin = t1; hitAxis = 3; hitSign = sign end
-        if t2 < tMax then tMax = t2 end
-        if tMin > tMax then return nil end
-    end
-
-    if tMax < 0 or tMin > 1 then return nil end
-    local t = tMin >= 0 and tMin or tMax
-    if t > 1 then return nil end
-
-    local nx = hitAxis == 1 and hitSign or 0
-    local ny = hitAxis == 2 and hitSign or 0
-    local nz = hitAxis == 3 and hitSign or 0
-    
-    return t, origin + direction * t, cframe:VectorToWorldSpace(Vector3.new(nx, ny, nz))
-end
-
-function Raycaster:Raycast(origin, direction, ignoreList, maxDistance)
-    ensureCache()
-    
-    local cellSize = GRID_SIZE
-    local grid = Cache.grid
-    local globalEntries = Cache.globalEntries or {}
-    
-    local dirMag = direction.Magnitude
-    if dirMag == 0 then return nil end
-    
-    local rayUnit = direction / dirMag
-    local rayLength
-    
-    if maxDistance then
-        rayLength = maxDistance
-    else
-        rayLength = math.min(dirMag, DEFAULT_MAX_DISTANCE)
-    end
-    
-    if rayLength <= 0 then return nil end
-    
-    local effectiveLength = math.min(rayLength, MAX_EFFECTIVE_DISTANCE)
-    local scaledDir = rayUnit * effectiveLength
-    
-    local ignoreDict = {}
-    if ignoreList then
-        for i = 1, #ignoreList do
-            local p = ignoreList[i]
-            if p then
-                ignoreDict[p.Address] = true
-            end
-        end
-    end
-    
-    local stepSize = cellSize * 0.5
-    local numSteps = math.ceil(effectiveLength / stepSize)
-    
-    local seen = {}
-    local closestResult = nil
-    local closestT = math.huge
-    local ox, oy, oz = origin.X, origin.Y, origin.Z
-    local dx, dy, dz = rayUnit.X, rayUnit.Y, rayUnit.Z
-
-    -- 1. Check partitioned global entries (giant parts) first to keep execution safe
-    for i = 1, #globalEntries do
-        local entry = globalEntries[i]
-        local addr = entry.address
-        
-        if not seen[addr] and not ignoreDict[addr] then
-            seen[addr] = true
-            
-            local hitT, hitPos, hitNormal = rayIntersectOBB(origin, scaledDir, entry.cframe, entry.size)
-            if hitT and hitT < closestT then
-                closestT = hitT
-                closestResult = {
-                    Instance = entry.instance,
-                    Position = hitPos,
-                    Normal = hitNormal,
-                    Distance = effectiveLength * hitT,
-                }
-            end
-        end
-    end
-
-    -- 2. Query the standard localized spatial grid
-    for i = 0, numSteps do
-        local t = i * stepSize
-        if t > effectiveLength then t = effectiveLength end
-        
-        local px = ox + dx * t
-        local py = oy + dy * t
-        local pz = oz + dz * t
-        
-        local cx, cy, cz = worldToCell(px, py, pz, cellSize)
-        local key = cellKey(cx, cy, cz)
-        local bucket = grid[key]
-        
-        if bucket then
-            for j = 1, #bucket do
-                local entry = bucket[j]
-                local addr = entry.address
-                
-                if not seen[addr] and not ignoreDict[addr] then
-                    seen[addr] = true
-                    
-                    local pdx = entry.posX - ox
-                    local pdy = entry.posY - oy
-                    local pdz = entry.posZ - oz
-                    local proj = pdx * dx + pdy * dy + pdz * dz
-                    local radius = entry.radius
-                    
-                    if proj > -radius and proj < effectiveLength + radius then
-                        local clamped = proj < 0 and 0 or (proj > effectiveLength and effectiveLength or proj)
-                        local cpx = ox + dx * clamped
-                        local cpy = oy + dy * clamped
-                        local cpz = oz + dz * clamped
-                        local diffX = entry.posX - cpx
-                        local diffY = entry.posY - cpy
-                        local diffZ = entry.posZ - cpz
-                        local distSq = diffX*diffX + diffY*diffY + diffZ*diffZ
-                        
-                        if distSq <= radius * radius then
-                            local hitT, hitPos, hitNormal = rayIntersectOBB(origin, scaledDir, entry.cframe, entry.size)
-                            if hitT and hitT < closestT then
-                                closestT = hitT
-                                closestResult = {
-                                    Instance = entry.instance,
-                                    Position = hitPos,
-                                    Normal = hitNormal,
-                                    Distance = effectiveLength * hitT,
-                                }
-                            end
-                        end
-                    end
-                end
-            end
-        end
-        
-        if closestResult and t > closestT * effectiveLength then
-            break
-        end
-    end
-
-    return closestResult
-end
-
-function Raycaster:RaycastTo(origin, target, ignoreList, maxDistance)
-    return self:Raycast(origin, target - origin, ignoreList, maxDistance)
-end
-
-function Raycaster:GatherParts(instance)
-    local list = {}
-    if not instance then return list end
-    
-    local descendants = instance:GetDescendants()
-    for i = 1, #descendants do
-        local child = descendants[i]
-        if BASE_PART_CLASSES[child.ClassName] then
-            list[#list + 1] = child
-        end
-    end
-    return list
-end
-
-function Raycaster:RefreshCache()
-    if not Cache.isBuilding then
-        task.spawn(buildCache)
-    end
-end
-
-function Raycaster:SetGridSize(size)
-    GRID_SIZE = math.max(1, size)
-    Cache.entries = {}
-    Cache.grid = {}
-    Cache.globalEntries = {}
-end
-
-function Raycaster:SetCacheRefreshRate(seconds)
-    CACHE_REFRESH_RATE = math.max(0, seconds)
-end
-
-function Raycaster:SetDefaultMaxDistance(distance)
-    DEFAULT_MAX_DISTANCE = math.max(0, distance)
-end
-
--- Sync original Raycaster settings with initial cfg parameters
-Raycaster:SetGridSize(cfg.gridSize)
-Raycaster:SetCacheRefreshRate(cfg.cacheRefreshRate)
 
 -- =====================================================================
 -- 4. INS UI INTEGRATION WITH SAFE BUILDERS
@@ -491,30 +161,14 @@ end)
 
 -- Right Column: Performance Settings
 local perfSection = tracerTab:Section("Performance", "Right")
-
-perfSection:Info("Note: Higher grid sizes increase raycast collision accuracy but can cause noticeable performance lag.")
-
--- Grid Size Slider matched to original performant range (32 to 256)
-safeSlider(perfSection, "Grid Size", cfg.gridSize, 1, 32, 256, "", function(val)
-    cfg.gridSize = val
-    Raycaster:SetGridSize(val)
-end)
-
--- Cache Refresh Slider matched to original performance rate controls
-safeSlider(perfSection, "Cache Refresh", cfg.cacheRefreshRate, 1, 10, 60, "s", function(val)
-    cfg.cacheRefreshRate = val
-    Raycaster:SetCacheRefreshRate(val)
-end)
-
--- Add standard settings page (Themes, configurations, open/close key, etc.)
-win:AddSettingsTab("cog")
+perfSection:Info("Tracer is running on Roblox's native raycasting. Viewmodel operations have been optimized to eliminate FPS stutters.")
 
 -- =====================================================================
 -- 5. DRAWING MANAGER
 -- =====================================================================
 local activeTracers = {}
 local drawings = {}
-local lastFrameDrawCount = 0 -- Tracks active drawings from the previous frame to avoid blanket resets
+local lastFrameDrawCount = 0
 
 local function lerp(a, b, t) return a + (b - a) * t end
 local function lerpColor(c1, c2, t)
@@ -561,13 +215,12 @@ local function gOC(idx)
 end
 
 -- PRE-ALLOCATE OBJECT POOL
--- This prevents the executor from suffering garbage collection spikes and thread-blocking allocations mid-combat
 local PRE_ALLOCATE_COUNT = 300
 task.spawn(function()
     for i = 1, PRE_ALLOCATE_COUNT do
         gOC(i)
         if i % 15 == 0 then
-            task.wait() -- Spread initialization work smoothly over several frames
+            task.wait()
         end
     end
 end)
@@ -585,7 +238,6 @@ local function renderTracers()
     local drawIdx = 0
 
     if not cfg.enabled then 
-        -- Clean up previously active drawings immediately if disabled
         for idx = 1, lastFrameDrawCount do
             local d = drawings[idx]
             if d then d.Visible = false end
@@ -603,7 +255,6 @@ local function renderTracers()
         if alpha > 0.01 then
             table.insert(aliveTracers, tracer)
 
-            -- Calculate vector properties first so segments can scale dynamically
             local dir, right, trueUp, lengthFactor, freqRatio = nil, nil, nil, 1.0, 1.0
             local displacementVec = tracer.target - tracer.start
             local magnitude = displacementVec.Magnitude
@@ -613,31 +264,26 @@ local function renderTracers()
                 right = dir:Cross(up).Unit
                 trueUp = right:Cross(dir).Unit
                 
-                -- Amplitude and frequency modifiers dynamically mapped to physical length
-                lengthFactor = math.clamp(magnitude / 150, 0.05, 0.75) -- Max displacement capped at 0.75 to prevent wild shaking on long shots
-                freqRatio = math.clamp(magnitude / 250, 0.15, 1.6)     -- Cap wavelength frequency scaling to prevent erratic clustering
+                lengthFactor = math.clamp(magnitude / 150, 0.05, 0.75)
+                freqRatio = math.clamp(magnitude / 250, 0.15, 1.6)
             end
 
-            -- Determine segment counts dynamically
             local numSegments = cfg.segments or 5
             if cfg.trailType == "solid" then
                 numSegments = 1
             elseif cfg.trailType == "Rope kinda?" then
-                -- Scale segments proportionally to the normalized frequency ratio to prevent rendering jagged aliasing
                 numSegments = math.max(numSegments, math.floor(15 * freqRatio))
-                numSegments = math.clamp(numSegments, 15, 45) -- Cap to 45 segments for performance
+                numSegments = math.clamp(numSegments, 15, 45)
             end
 
             local function getElectricOffset(t)
                 if not right or t <= 0 or t >= 1 then return Vector3.zero end
                 local envelope = math.sin(t * math.pi)
                 
-                -- Optimization: Stretch wave progressively near the target end (t -> 1) to counteract 3D perspective foreshortening
                 local stretch = (1 - t * t * 0.65)
                 local angleX = t * (5 * freqRatio) * stretch - now * 10 + tIdx
                 local angleY = t * (11 * freqRatio) * stretch + now * 12 - tIdx
                 
-                -- Clean overlapping sine waves with adjusted base frequencies to prevent chaotic clustering
                 local waveX = math.sin(angleX) * 1.5 + math.cos(angleX * 2.2) * 0.4
                 local waveY = math.cos(angleY) * 1.5 + math.sin(angleY * 2.2) * 0.4
                     
@@ -652,7 +298,6 @@ local function renderTracers()
                 local p1 = tracer.start:Lerp(tracer.target, t1)
                 local p2 = tracer.start:Lerp(tracer.target, t2)
 
-                -- Apply displacement for electricity noise
                 if cfg.trailType == "Rope kinda?" then
                     p1 = p1 + getElectricOffset(t1)
                     p2 = p2 + getElectricOffset(t2)
@@ -661,9 +306,46 @@ local function renderTracers()
                 local sp1, onScreen1 = MatchaWorldToScreen(p1)
                 local sp2, onScreen2 = MatchaWorldToScreen(p2)
 
+                -- Perform clip processing only when a segment passes from on-screen to off-screen
+                local drawSegment = false
+                local finalSP1, finalSP2
+
                 if onScreen1 and onScreen2 then
-                    local prevSP = Vector2.new(sp1.X, sp1.Y)
-                    local curSP = Vector2.new(sp2.X, sp2.Y)
+                    finalSP1 = Vector2.new(sp1.X, sp1.Y)
+                    finalSP2 = Vector2.new(sp2.X, sp2.Y)
+                    drawSegment = true
+                elseif onScreen1 and not onScreen2 then
+                    local clippedSP2 = getClippedPoint(p1, p2)
+                    if clippedSP2 then
+                        finalSP1 = Vector2.new(sp1.X, sp1.Y)
+                        finalSP2 = Vector2.new(clippedSP2.X, clippedSP2.Y)
+                        drawSegment = true
+                    end
+                elseif not onScreen1 and onScreen2 then
+                    local clippedSP1 = getClippedPoint(p2, p1)
+                    if clippedSP1 then
+                        finalSP1 = Vector2.new(clippedSP1.X, clippedSP1.Y)
+                        finalSP2 = Vector2.new(sp2.X, sp2.Y)
+                        drawSegment = true
+                    end
+                else
+                    -- Midpoint check: If both ends are off-screen but segment crosses screen center
+                    local pMid = p1:Lerp(p2, 0.5)
+                    local spMid, onScreenMid = MatchaWorldToScreen(pMid)
+                    if onScreenMid then
+                        local clippedSP1 = getClippedPoint(pMid, p1)
+                        local clippedSP2 = getClippedPoint(pMid, p2)
+                        if clippedSP1 and clippedSP2 then
+                            finalSP1 = Vector2.new(clippedSP1.X, clippedSP1.Y)
+                            finalSP2 = Vector2.new(clippedSP2.X, clippedSP2.Y)
+                            drawSegment = true
+                        end
+                    end
+                end
+
+                if drawSegment then
+                    local prevSP = finalSP1
+                    local curSP = finalSP2
 
                     local tt = cfg.trailType
                     local col = sampleColors(t1)
@@ -686,18 +368,16 @@ local function renderTracers()
                     end
 
                     if tt == "Rope kinda?" then
-                        -- Progressively fade thickness and transparency along the length of the tracer
                         local fadeFactor = (1 - t1) * 0.9 + 0.1
-                        local elecAlpha = alpha * fadeFactor * (0.8 + 0.2 * math.sin(now * 25 + tIdx * 10 + sIdx)) -- Organic flickering
+                        local elecAlpha = alpha * fadeFactor * (0.8 + 0.2 * math.sin(now * 25 + tIdx * 10 + sIdx))
                         local elecThickness = cfg.thickness * fadeFactor
 
-                        -- 5-Layer Amplified Glow Profile
                         local layers = {
-                            { elecThickness * 14,  elecAlpha * 0.04 }, -- Broad, soft outer halo
-                            { elecThickness * 7,   elecAlpha * 0.12 }, -- Medium bloom ring
-                            { elecThickness * 3.5, elecAlpha * 0.32 }, -- Tight core glow
-                            { elecThickness * 1.6, elecAlpha * 0.7  }, -- Strong inner core
-                            { elecThickness * 0.6, elecAlpha        }, -- Sharp bright center core
+                            { elecThickness * 14,  elecAlpha * 0.04 },
+                            { elecThickness * 7,   elecAlpha * 0.12 },
+                            { elecThickness * 3.5, elecAlpha * 0.32 },
+                            { elecThickness * 1.6, elecAlpha * 0.7  },
+                            { elecThickness * 0.6, elecAlpha        },
                         }
                         for _, layer in ipairs(layers) do
                             drawIdx = drawIdx + 1
@@ -750,7 +430,6 @@ local function renderTracers()
         end
     end
     
-    -- Smart Visibility Cleanup: Only toggle elements transitioning from active to inactive
     for idx = drawIdx + 1, lastFrameDrawCount do
         local d = drawings[idx]
         if d then
@@ -768,11 +447,14 @@ end
 local function getIgnoreList()
     local ignore = {}
     if player.Character then
-        local charParts = Raycaster:GatherParts(player.Character)
-        for i = 1, #charParts do
-            table.insert(ignore, charParts[i])
-        end
+        table.insert(ignore, player.Character)
     end
+    
+    local cam = getActiveCamera()
+    if cam then
+        table.insert(ignore, cam)
+    end
+    
     return ignore
 end
 
@@ -792,20 +474,25 @@ local function isArmDescendant(instance)
     return false
 end
 
+-- Highly targeted scanning limits searches directly inside Camera's Model subclasses
 local function findPFMuzzlePart()
     local cam = getActiveCamera()
     if not cam then return nil end
     
-    local descendants = cam:GetDescendants()
-    for i = 1, #descendants do
-        local child = descendants[i]
-        if child and BASE_PART_CLASSES[child.ClassName] then
-            -- Verify this part is not an arm or hand mesh
-            if not isArmDescendant(child) then
-                -- Find the SpecialMesh child directly, ignoring sibling dynamic sound additions
-                local mesh = child:FindFirstChildOfClass("SpecialMesh")
-                if mesh then
-                    return child
+    local children = cam:GetChildren()
+    for i = 1, #children do
+        local child = children[i]
+        if child.ClassName == "Model" then
+            local modelDescendants = child:GetDescendants()
+            for j = 1, #modelDescendants do
+                local part = modelDescendants[j]
+                if part and BASE_PART_CLASSES[part.ClassName] then
+                    if not isArmDescendant(part) then
+                        local mesh = part:FindFirstChildOfClass("SpecialMesh")
+                        if mesh then
+                            return part
+                        end
+                    end
                 end
             end
         end
@@ -816,7 +503,7 @@ end
 local resolvedMuzzlePart = nil
 local lastMuzzleScan = 0
 
--- Unconditional active viewmodel scanning running on a strict 0.5s timer
+-- Scan cache updates cleanly only when the current muzzle gets unparented, preventing scanning lag
 local function getOriginPart(character)
     local now = tick()
     
@@ -850,16 +537,15 @@ local function getMagCountLabel()
     return textMagCount
 end
 
--- Trigger a safe raycast simulation and generate active lines
+-- Trigger a safe raycast simulation and generate active lines using Roblox Native Raycast API
 local function triggerTracer()
     local character = player.Character
     local originPart = getOriginPart(character)
     
     if originPart then
-        -- Safely extract position to prevent destroyed instance crashes
         local successPos, posVal = pcall(function() return originPart.Position end)
         if not successPos or not posVal then
-            return -- Abort gracefully if part is invalid/destroyed on this frame
+            return
         end
         
         local origin = posVal
@@ -873,7 +559,6 @@ local function triggerTracer()
             cf = CFrame.new(origin)
         end
         
-        -- Resolve shooting direction directly from viewmodel's resolved forward vector (LookVector)
         local direction = Vector3.new(0, 0, -maxRange)
         if cf then
             local successMuzzleLook, muzzleLookVal = pcall(function() return cf.LookVector end)
@@ -883,7 +568,12 @@ local function triggerTracer()
         end
         
         local ignoreList = getIgnoreList()
-        local result = Raycaster:Raycast(origin, direction, ignoreList)
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = ignoreList
+        params.IgnoreWater = true
+        
+        local result = workspace:Raycast(origin, direction, params)
         
         local targetPosition
         if result then
@@ -899,11 +589,7 @@ end
 -- =====================================================================
 -- INITIALIZATION WORKER
 -- =====================================================================
-task.spawn(function()
-    buildCache()
-end)
-
--- Continuous background scanner for muzzle identification (runs on 0.5s interval)
+-- Continuous background scanner for muzzle identification (runs on 0.5s interval with targeted viewmodel model queries)
 local backgroundScanner = task.spawn(function()
     while true do
         local character = player.Character
@@ -918,14 +604,12 @@ end)
 local function handleTracerAndInputs()
     camera = getActiveCamera()
 
-    -- Keep active tracers rendering
     renderTracers()
 
     if not isrbxactive() then 
         return 
     end
     
-    -- Bullet tracking loop: Triggers exactly when TextMagCount drops by 1
     local magLabel = getMagCountLabel()
     if magLabel then
         local rawText = magLabel.Text
@@ -934,7 +618,6 @@ local function handleTracerAndInputs()
             local currentAmmo = tonumber(cleanText)
             
             if currentAmmo then
-                -- Verify if ammo value has dropped relative to the last captured frame
                 if lastAmmoValue and currentAmmo < lastAmmoValue then
                     triggerTracer()
                 end
@@ -956,10 +639,6 @@ local connection = RunService.RenderStepped:Connect(handleTracerAndInputs)
 _G.MatchaTracerCleanup = function()
     if connection then connection:Disconnect() end
     if backgroundScanner then pcall(task.cancel, backgroundScanner) end
-    
-    if Cache.activeThread then
-        pcall(task.cancel, Cache.activeThread)
-    end
     
     if _G.MatchaTracerWindow then
         pcall(function() _G.MatchaTracerWindow:Destroy() end)
