@@ -160,10 +160,6 @@ colorSection:Colorpicker("Secondary Color", cfg.colors[2], function(col, alpha)
     cfg.colors[2] = col
 end)
 
--- Right Column: Performance Settings
-local perfSection = tracerTab:Section("Performance", "Right")
-perfSection:Info("Tracer is running on Roblox's native raycasting. Viewmodel operations have been optimized to eliminate FPS stutters.")
-
 -- =====================================================================
 -- 5. MISC TAB & SECTIONS
 -- =====================================================================
