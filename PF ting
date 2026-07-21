@@ -556,6 +556,31 @@ modsSection:Button("Apply Mods", function()
     Lib:Notify("Weapon Mods", "Weapon settings applied successfully", 2, "success")
 end)
 
+-- Right Column: Crosshair Settings
+local crosshairSection = miscTab:Section("Crosshair", "Right")
+
+crosshairSection:Info("Note: You must rejoin the game to reset your crosshair.")
+
+crosshairSection:Button("Small Crosshair", function()
+    pcall(setgc, {
+        crosssize = 1,
+        crossexpansion = 0,
+        crossspeed = 100,
+        crossdamper = 1
+    })
+    Lib:Notify("Crosshair", "Small crosshair applied", 2, "success")
+end)
+
+crosshairSection:Button("No Crosshair", function()
+    pcall(setgc, {
+        crosssize = 1000000000,
+        crossexpansion = 0,
+        crossspeed = 100,
+        crossdamper = 1
+    })
+    Lib:Notify("Crosshair", "Crosshair disabled", 2, "success")
+end)
+
 -- Add standard settings page
 win:AddSettingsTab("cog")
 
