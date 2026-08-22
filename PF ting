@@ -98,7 +98,7 @@ end
 local Lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua"))() or INSui
 
 local win = Lib:CreateWindow({
-    title        = "Matcha Tracer Engine",
+    title        = "Geeg Lad",
     subtitle     = "Phantom Forces",
     size         = Vector2.new(580, 460),
     menuKey      = "p",
@@ -163,7 +163,8 @@ end)
 -- =====================================================================
 -- 5. MISC TAB & SECTIONS
 -- =====================================================================
-local miscTab = win:Tab("Misc", "wrench")
+-- Changed icon to "three-dots-horizontal" to fix missing icon
+local miscTab = win:Tab("Misc", "three-dots-horizontal")
 
 -- Left Column: Unlock settings
 local unlockSection = miscTab:Section("Unlock", "Left")
@@ -494,21 +495,59 @@ end)
 local modsSection = miscTab:Section("Weapon mods", "Right")
 
 local pendingSway = false
-local pendingHipFire = false
-local hipFireValue = 0.0
 local pendingAimWalk = false
 local aimWalkValue = 1.0
+local pendingNoRecoil = false
+
+-- --- No Recoil (One-time application) ---
+local containerKeys = { "recoil", "_spreadSpring", "_translationSprings", "_rotationSprings" }
+local numberKeys = {
+    "swayamp", "xbias", "ybias", "choke",
+    "hipfirespread", "aimfirespread", "crossexpansion", "_firemodeStability"
+}
+
+-- Recursively zero all number and Vector3 fields in a table
+local function zeroTable(t, depth)
+    if type(t) ~= "table" then return end
+    depth = depth or 4
+    if depth <= 0 then return end
+
+    for k, v in pairs(t) do
+        local vt = type(v)
+        if vt == "number" then
+            t[k] = 0
+        elseif vt == "table" then
+            zeroTable(v, depth - 1)
+        elseif typeof and typeof(v) == "Vector3" then
+            t[k] = Vector3.zero
+        end
+    end
+end
+
+-- Apply all no-recoil modifications once
+local function applyNoRecoilOnce()
+    -- Zero top-level number fields
+    local numberCache = getgc(numberKeys)
+    for _, key in ipairs(numberKeys) do
+        pcall(applygc, numberCache, key, 0)
+    end
+
+    -- Zero recoil / spring table contents
+    local containerCache = getgc(containerKeys)
+    for _, entry in ipairs(containerCache) do
+        if entry and entry.type == "table" then
+            zeroTable(entry.value, 4)
+        end
+    end
+end
 
 modsSection:Toggle("Remove weapon sway", false, function(on)
     pendingSway = on
 end)
 
-modsSection:Toggle("Hip fire", false, function(on)
-    pendingHipFire = on
-end)
-
-safeSlider(modsSection, "Hip fire spread", hipFireValue, 1, 0, 10, "", function(val)
-    if val then hipFireValue = val end
+-- No Recoil toggle now only sets pending flag, does not apply immediately
+modsSection:Toggle("No recoil", false, function(on)
+    pendingNoRecoil = on
 end)
 
 modsSection:Toggle("Aiming walk speed", false, function(on)
@@ -533,14 +572,8 @@ modsSection:Button("Apply Mods", function()
         })
     end
 
-    if pendingHipFire then
-        pcall(function()
-            local targetProperties = { "hipfirespread" }
-            local weaponGC = getgc(targetProperties)
-            if weaponGC then
-                applygc(weaponGC, "hipfirespread", hipFireValue)
-            end
-        end)
+    if pendingNoRecoil then
+        applyNoRecoilOnce()
     end
 
     if pendingAimWalk then
