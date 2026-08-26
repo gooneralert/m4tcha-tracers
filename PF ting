@@ -526,19 +526,23 @@ end
 
 -- Apply all no-recoil modifications once
 local function applyNoRecoilOnce()
-    -- Zero top-level number fields
-    local numberCache = getgc(numberKeys)
-    for _, key in ipairs(numberKeys) do
-        pcall(applygc, numberCache, key, 0)
-    end
-
-    -- Zero recoil / spring table contents
-    local containerCache = getgc(containerKeys)
-    for _, entry in ipairs(containerCache) do
-        if entry and entry.type == "table" then
-            zeroTable(entry.value, 4)
+    task.spawn(function()
+        -- Zero top-level number fields one by one with delay
+        local numberCache = getgc(numberKeys)
+        for _, key in ipairs(numberKeys) do
+            pcall(applygc, numberCache, key, 0)
+            task.wait(0.05)  -- pause between each key
         end
-    end
+
+        -- Zero recoil / spring table contents with delay
+        local containerCache = getgc(containerKeys)
+        for _, entry in ipairs(containerCache) do
+            if entry and entry.type == "table" then
+                zeroTable(entry.value, 4)
+                task.wait(0.05)  -- pause after each table
+            end
+        end
+    end)
 end
 
 modsSection:Toggle("Remove weapon sway", false, function(on)
@@ -560,29 +564,38 @@ end)
 
 modsSection:Button("Apply Mods", function()
     if pendingSway then
-        pcall(setgc, {
-            walkswayamphipmult = 0,
-            walkswayampaimmult = 0,
-            walkswayrothipmult = 0,
-            walkswayrotaimmult = 0,
-            idleswaycyclespeed = 0,
-            idleswayamphipmult = 0,
-            idleswayampaimmult = 0,
-            simpleswayparameters = 0,
-        })
+        task.spawn(function()
+            local swayKeys = {
+                "walkswayamphipmult",
+                "walkswayampaimmult",
+                "walkswayrothipmult",
+                "walkswayrotaimmult",
+                "idleswaycyclespeed",
+                "idleswayamphipmult",
+                "idleswayampaimmult",
+                "simpleswayparameters",
+            }
+            for _, key in ipairs(swayKeys) do
+                pcall(setgc, { [key] = 0 })
+                task.wait(0.1)
+            end
+        end)
     end
 
     if pendingNoRecoil then
-        applyNoRecoilOnce()
+        applyNoRecoilOnce()  -- already async from earlier change
     end
 
     if pendingAimWalk then
-        pcall(function()
-            local targetProperties = { "aimwalkspeedmult" }
-            local weaponGC = getgc(targetProperties)
-            if weaponGC then
-                applygc(weaponGC, "aimwalkspeedmult", aimWalkValue)
-            end
+        task.spawn(function()
+            task.wait(0.1)
+            pcall(function()
+                local targetProperties = { "aimwalkspeedmult" }
+                local weaponGC = getgc(targetProperties)
+                if weaponGC then
+                    applygc(weaponGC, "aimwalkspeedmult", aimWalkValue)
+                end
+            end)
         end)
     end
 
