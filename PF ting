@@ -531,7 +531,6 @@ local function applyNoRecoilOnce()
         local numberCache = getgc(numberKeys)
         for _, key in ipairs(numberKeys) do
             pcall(applygc, numberCache, key, 0)
-            task.wait(0.05)  -- pause between each key
         end
 
         -- Zero recoil / spring table contents with delay
@@ -539,7 +538,6 @@ local function applyNoRecoilOnce()
         for _, entry in ipairs(containerCache) do
             if entry and entry.type == "table" then
                 zeroTable(entry.value, 4)
-                task.wait(0.05)  -- pause after each table
             end
         end
     end)
@@ -569,36 +567,21 @@ end)
 
 modsSection:Button("Apply Mods", function()
     if pendingSway then
-        task.spawn(function()
-            local swayKeys = {
-                "walkswayamphipmult",
-                "walkswayampaimmult",
-                "walkswayrothipmult",
-                "walkswayrotaimmult",
-                "idleswaycyclespeed",
-                "idleswayamphipmult",
-                "idleswayampaimmult",
-                "simpleswayparameters",
-            }
-            for _, key in ipairs(swayKeys) do
-                pcall(setgc, { [key] = 0 })
-                task.wait(0.1)
-            end
-        end)
+        local cache = getgc({"walkswayamphipmult", "walkswayampaimmult", "walkswayrothipmult", "walkswayrotaimmult", "idleswaycyclespeed", "idleswayamphipmult", "simpleswayparameters"})
+        applygc(cache, { walkswayamphipmult = 0, walkswayampaimmult = 0, walkswayrothipmult = 0, walkswayrotaimmult = 0, idleswaycyclespeed = 0, idleswayamphipmult = 0, idleswayampaimmult = 0, simpleswayparameters = 0 })
     end
 
     if pendingNoRecoil then
-        applyNoRecoilOnce()  -- already async from earlier change
+        applyNoRecoilOnce()
     end
 
     if pendingInstantReload then
-	local cache = getgc({"timescale"})
-	applygc(cache, "timescale", 0)
+        local cache = getgc({"timescale"})
+        applygc(cache, "timescale", 0)
     end
 
     if pendingAimWalk then
         task.spawn(function()
-            task.wait(0.1)
             pcall(function()
                 local targetProperties = { "aimwalkspeedmult" }
                 local weaponGC = getgc(targetProperties)
@@ -611,7 +594,6 @@ modsSection:Button("Apply Mods", function()
 
     Lib:Notify("Weapon Mods", "Weapon settings applied successfully", 2, "success")
 end)
-
 -- Right Column: Crosshair Settings
 local crosshairSection = miscTab:Section("Crosshair", "Right")
 
