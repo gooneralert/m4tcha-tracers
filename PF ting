@@ -558,6 +558,10 @@ modsSection:Toggle("Aiming walk speed", false, function(on)
     pendingAimWalk = on
 end)
 
+modsSection:Toggle("Instant reload", false, function(on)
+    pendingInstantReload = on
+end)
+
 safeSlider(modsSection, "Aiming walk mult", aimWalkValue, 0.1, 1.0, 4.0, "x", function(val)
     if val then aimWalkValue = val end
 end)
@@ -584,6 +588,11 @@ modsSection:Button("Apply Mods", function()
 
     if pendingNoRecoil then
         applyNoRecoilOnce()  -- already async from earlier change
+    end
+
+    if pendingInstantReload then
+	local cache = getgc({"timescale"})
+	applygc(cache, "timescale", 0)
     end
 
     if pendingAimWalk then
