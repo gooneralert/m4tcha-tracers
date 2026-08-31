@@ -1,12 +1,3 @@
--- filepath: client/matcha_tracer.lua
--- =====================================================================
--- INITIALIZATION CONSOLE OUTPUT
--- =====================================================================
-print("script loading")
-
--- =====================================================================
--- CLEANUP PREVIOUS RUNS (Prevents crashes/stutters on restart)
--- =====================================================================
 if _G.MatchaTracerCleanup then
     pcall(_G.MatchaTracerCleanup)
 end
@@ -17,45 +8,32 @@ if _G.MatchaTracerWindow then
     _G.MatchaTracerWindow = nil
 end
 
--- Ensure we utilize Matcha's native global WorldToScreen function
-local MatchaWorldToScreen = WorldToScreen
+local w2s = WorldToScreen
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local player = Players.LocalPlayer
 
--- =====================================================================
--- 1. CONFIGURATION (Modify these settings to customize your tracer)
--- =====================================================================
 local cfg = {
     enabled = true,
-    trailType = "rainbow", -- options: solid, neon, pulse, rainbow, flicker, Rope kinda?
+    trailType = "rainbow",
     colors = {
         Color3.fromHex("ff0040"),
         Color3.fromHex("70001a"),
     },
     fadeTime = 3.0,
     thickness = 2.0,
-    segments = 5,            -- Lowered default from 25 to 5 for major rendering speedup
+    segments = 5,
 }
 
--- =====================================================================
--- 2. GLOBALS & SERVICES
--- =====================================================================
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local Workspace = game:GetService("Workspace")
-
-local player = Players.LocalPlayer
-
--- Safe Camera Resolver that bypasses workspace name obfuscation
-local function getActiveCamera()
+local function getCamera()
     return Workspace.CurrentCamera or Workspace:FindFirstChildOfClass("Camera") or Workspace:FindFirstChild("Camera")
 end
 
-local camera = getActiveCamera()
+local camera = getCamera()
+local lastAmmo = nil
 
--- UPVALUES FOR DYNAMIC AMMO TRACKING
-local lastAmmoValue = nil
-
--- Base Part Class validation helper
-local BASE_PART_CLASSES = {
+local validParts = {
     Part = true,
     MeshPart = true,
     UnionOperation = true,
@@ -67,244 +45,211 @@ local BASE_PART_CLASSES = {
     VehicleSeat = true,
 }
 
--- =====================================================================
--- 3. LINE CLIPPING ALGORITHM
--- =====================================================================
--- Finds the exact 3D point on the screen edge where the tracer crosses the viewport boundary
-local function getClippedPoint(pOn, pOff)
-    local low = 0
-    local high = 1
-    local bestP = pOn
+local function clipPoint(p1, p2)
+    local low, high = 0, 1
+    local bestP = p1
     local bestSP = nil
     
     for i = 1, 5 do
         local mid = (low + high) * 0.5
-        local p_mid = pOn:Lerp(pOff, mid)
-        local sp, onScreen = MatchaWorldToScreen(p_mid)
+        local pMid = p1:Lerp(p2, mid)
+        local sp, onScreen = w2s(pMid)
         if onScreen then
-            bestP = p_mid
+            bestP = pMid
             bestSP = sp
             low = mid
         else
             high = mid
         end
     end
-    return bestSP or MatchaWorldToScreen(bestP)
+    return bestSP or w2s(bestP)
 end
 
--- =====================================================================
--- 4. INS UI INTEGRATION WITH SAFE BUILDERS
--- =====================================================================
 local Lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua"))() or INSui
 
 local win = Lib:CreateWindow({
-    title        = "Geeg Lad",
-    subtitle     = "Phantom Forces",
-    size         = Vector2.new(580, 460),
-    menuKey      = "p",
-    configName   = "matcha_tracer_cfg",
+    title = "Geeg Lad",
+    subtitle = "Phantom Forces",
+    size = Vector2.new(580, 460),
+    menuKey = "p",
+    configName = "matcha_tracer_cfg",
     configFolder = "MatchaTracer",
-    autoSave     = true,
-    startOpen    = true,
+    autoSave = true,
+    startOpen = true,
 })
 
--- Store window globally to allow proper cleanup on restart
 _G.MatchaTracerWindow = win
 
 local tracerTab = win:Tab("Tracers", "sliders")
 
--- Helper function to safely catch UI building errors and log them to F9
-local function safeSlider(section, label, default, step, min, max, suffix, callback)
-    local success, result = pcall(function()
-        return section:Slider(label, default, step, min, max, suffix, callback)
+local function addSlider(sec, label, def, step, min, max, sfx, cb)
+    local ok, res = pcall(function()
+        return sec:Slider(label, def, step, min, max, sfx, cb)
     end)
-    if not success then
-        warn("[Matcha Debug] Error creating Slider '" .. tostring(label) .. "': " .. tostring(result))
+    if not ok then
+        warn("[Debug] Slider error:", label, res)
     end
-    return result
+    return res
 end
 
--- Left Section: Main configurations
 local configSection = tracerTab:Section("Configuration", "Left")
 
-configSection:Toggle("Enabled", cfg.enabled, function(state)
-    cfg.enabled = state
+configSection:Toggle("Enabled", cfg.enabled, function(v)
+    cfg.enabled = v
 end)
 
-configSection:Dropdown("Trail Type", {cfg.trailType}, {"solid", "neon", "pulse", "rainbow", "flicker", "Rope kinda?"}, false, function(selected)
-    if selected and selected[1] then
-        cfg.trailType = selected[1]
+configSection:Dropdown("Trail Type", {cfg.trailType}, {"solid", "neon", "pulse", "rainbow", "flicker", "Rope kinda?"}, false, function(v)
+    if v and v[1] then
+        cfg.trailType = v[1]
     end
 end)
 
-safeSlider(configSection, "Fade Time", cfg.fadeTime, 0.1, 0.1, 10.0, "s", function(val)
-    cfg.fadeTime = val
+addSlider(configSection, "Fade Time", cfg.fadeTime, 0.1, 0.1, 10.0, "s", function(v)
+    cfg.fadeTime = v
 end)
 
-safeSlider(configSection, "Thickness", cfg.thickness, 0.5, 0.5, 10.0, "px", function(val)
-    cfg.thickness = val
+addSlider(configSection, "Thickness", cfg.thickness, 0.5, 0.5, 10.0, "px", function(v)
+    cfg.thickness = v
 end)
 
-safeSlider(configSection, "Segments", cfg.segments, 1, 1, 100, "", function(val)
-    cfg.segments = val
+addSlider(configSection, "Segments", cfg.segments, 1, 1, 100, "", function(v)
+    cfg.segments = v
 end)
 
--- Right Column: Colors
 local colorSection = tracerTab:Section("Colors", "Right")
 
-colorSection:Colorpicker("Primary Color", cfg.colors[1], function(col, alpha)
-    cfg.colors[1] = col
+colorSection:Colorpicker("Primary Color", cfg.colors[1], function(c)
+    cfg.colors[1] = c
 end)
 
-colorSection:Colorpicker("Secondary Color", cfg.colors[2], function(col, alpha)
-    cfg.colors[2] = col
+colorSection:Colorpicker("Secondary Color", cfg.colors[2], function(c)
+    cfg.colors[2] = c
 end)
 
--- =====================================================================
--- 5. MISC TAB & SECTIONS
--- =====================================================================
--- Changed icon to "three-dots-horizontal" to fix missing icon
 local miscTab = win:Tab("Misc", "three-dots-horizontal")
-
--- Left Column: Unlock settings
 local unlockSection = miscTab:Section("Unlock", "Left")
 
-local pendingUnlockKills = false
-local pendingUnlockRank = false
+local pendingKills = false
+local pendingRank = false
 
 unlockSection:Info("Note: Weapon unlocks are fully visual (client-side only).")
 
-unlockSection:Toggle("Attachments", false, function(on)
-    pendingUnlockKills = on
+unlockSection:Toggle("Attachments", false, function(v)
+    pendingKills = v
 end)
 
-local uwToggle = unlockSection:Toggle("Unlock weapons", false, function(on)
-    pendingUnlockRank = on
+local uwToggle = unlockSection:Toggle("Unlock weapons", false, function(v)
+    pendingRank = v
 end)
 uwToggle:Tooltip("Fully visual")
 
 unlockSection:Button("Unlock", function()
-    if pendingUnlockKills then
-        pcall(function()
-            setgc("unlockkills", 0)
-        end)
+    if pendingKills then
+        pcall(function() setgc("unlockkills", 0) end)
     end
-    if pendingUnlockRank then
-        pcall(function()
-            setgc("unlockrank", 0)
-        end)
+    if pendingRank then
+        pcall(function() setgc("unlockrank", 0) end)
     end
     Lib:Notify("Unlocker", "Actions applied successfully", 2, "success")
 end)
 
--- Left Column: Visual Settings (ESP Integration)
 local visualSection = miscTab:Section("Visual", "Left")
 
-local gunEspActive = false
-local trackers = {}
+local gunEspOn = false
+local gunEspThread = nil
+local gunTrackers = {}
 
-local tagEspActive = false
+local tagEspOn = false
+local tagEspThread = nil
 local tagTrackers = {}
 
--- Weapon name caching to completely eliminate RenderStepped polling lag [11]
 local gunCache = {}
 local lastCacheTime = {}
 
-local function getGun(playerFolder)
-    local now = os.clock()
-    local folderName = playerFolder.Name
-    local lastTime = lastCacheTime[folderName]
+local function getGun(folder)
+    local now = tick()
+    local name = folder.Name
+    local last = lastCacheTime[name]
     
-    if not lastTime or (now - lastTime > 0.5) then
-        lastCacheTime[folderName] = now
-        local resolvedName = "Unknown"
+    if not last or (now - last > 0.5) then
+        lastCacheTime[name] = now
+        local found = "Unknown"
         
-        for _, child in next, playerFolder:GetChildren() do
+        for _, child in next, folder:GetChildren() do
             if child.ClassName == "Model" then
-                local gunName = child.Name
-                gunName = gunName:gsub("Main", ""):gsub("^%s+", ""):gsub("%s+$", "")
-                if gunName ~= "" then
-                    resolvedName = gunName
+                local g = child.Name:gsub("Main", ""):gsub("^%s+", ""):gsub("%s+$", "")
+                if g ~= "" then
+                    found = g
                     break
                 end
             end
         end
-        gunCache[folderName] = resolvedName
+        gunCache[name] = found
     end
     
-    return gunCache[folderName] or "Unknown"
+    return gunCache[name] or "Unknown"
 end
 
--- Base ESP Loader check
-local function ensureEspUtilityLoaded()
+local function loadEsp()
     if not _G.ESP_Utility then
-        local URL = "https://raw.githubusercontent.com/artxficial/matchastuff/main/esp_utility.lua"
-        local success, src = pcall(game.HttpGet, game, URL)
-        if success and src then
+        local ok, src = pcall(game.HttpGet, game, "https://raw.githubusercontent.com/artxficial/matchastuff/main/esp_utility.lua")
+        if ok and src then
             src = src:gsub("game%.Players%.LocalPlayer", 'game:GetService("Players").LocalPlayer')
             src = src:gsub("game%.Players", 'game:GetService("Players")')
             src = src:gsub('self:AddText%("Distance".-end%)', '')
             
-            local fn, err = loadstring(src)
-            if fn then
-                fn()
-            end
+            local fn = loadstring(src)
+            if fn then fn() end
         end
     end
     
     local ESP = _G.ESP_Utility or ESP_Utility
     if not ESP then return nil end
     
-    -- Patch the update cycle and metatables with a static patch guard to prevent recursive stack leaks [11]
     if not ESP._patched then
         ESP._patched = true
         
         pcall(function()
-            ESP._GetDistance = function(self)
-                return 0
-            end
-
+            ESP._GetDistance = function() return 0 end
             ESP._IsAlive = function(self)
-                if not self.Object then return false end
-                return true
+                return self.Object and self.Object.Parent ~= nil
             end
 
-            -- Overwrite internal update methods to add a metatable guard
-            local originalUpdate = ESP._Update
+            local oldUpdate = ESP._Update
             ESP._Update = function(self)
-                if not getmetatable(self) then return end
-                if not self._IsAlive or not self._DetermineVisibility then return end
-                
-                local success, err = pcall(originalUpdate, self)
-                if not success then
+                if not getmetatable(self) or not self._IsAlive or not self._DetermineVisibility then return end
+                local ok = pcall(oldUpdate, self)
+                if not ok then
                     pcall(function() self:Destroy() end)
                 end
             end
 
-            -- Custom Leak-Proof Destroy: Re-implemented to safely purge drawings even if Object is nil
-            local originalDestroy = ESP.Destroy
+            local oldDestroy = ESP.Destroy
             ESP.Destroy = function(self)
                 pcall(function()
-                    if self.Object and self.Object.Address and ESP.TrackersToUpdate then
-                        ESP.TrackersToUpdate[self.Object.Address] = nil
+                    if ESP.TrackersToUpdate and self.Object then
+                        ESP.TrackersToUpdate[self.Object] = nil
+                        if self.Object.Address then
+                            ESP.TrackersToUpdate[self.Object.Address] = nil
+                        end
                     end
                 end)
                 
                 pcall(function()
                     if self.Drawings then
-                        for _, drawObj in pairs(self.Drawings) do
-                            if type(drawObj) == "table" and drawObj.Drawing then
-                                pcall(function() drawObj.Drawing:Remove() end)
-                            elseif type(drawObj) == "table" then
-                                pcall(function() drawObj:Remove() end)
+                        for _, d in pairs(self.Drawings) do
+                            if type(d) == "table" and d.Drawing then
+                                pcall(function() d.Drawing:Remove() end)
+                            elseif type(d) == "table" then
+                                pcall(function() d:Remove() end)
                             else
-                                pcall(function() drawObj:Remove() end)
+                                pcall(function() d:Remove() end)
                             end
                         end
                     end
                 end)
                 
-                pcall(originalDestroy, self)
+                pcall(oldDestroy, self)
             end
         end)
     end
@@ -312,76 +257,62 @@ local function ensureEspUtilityLoaded()
 end
 
 visualSection:Toggle("Gun ESP", false, function(on)
-    gunEspActive = on
+    gunEspOn = on
+    if gunEspThread then
+        pcall(task.cancel, gunEspThread)
+        gunEspThread = nil
+    end
     
     if on then
-        task.spawn(function()
-            local ESP = ensureEspUtilityLoaded()
+        gunEspThread = task.spawn(function()
+            local ESP = loadEsp()
             if not ESP then return end
 
             local playersFolder = workspace:WaitForChild("Players")
-            local SHOW_NAME = false -- Optimized: Hides player names to show only the gun name
 
-            while gunEspActive do
-                local aliveKeys = {}
+            while gunEspOn do
+                local alive = {}
 
                 pcall(function()
-                    for _, teamFolder in next, playersFolder:GetChildren() do
-                        for _, playerFolder in next, teamFolder:GetChildren() do
-                            for _, inner in next, playerFolder:GetChildren() do
-                                local isPhysical = inner and (inner.ClassName == "Model" or inner:IsA("BasePart"))
-                                if isPhysical then
+                    for _, team in next, playersFolder:GetChildren() do
+                        for _, pFolder in next, team:GetChildren() do
+                            for _, inner in next, pFolder:GetChildren() do
+                                if inner and (inner.ClassName == "Model" or inner:IsA("BasePart")) then
                                     local gui = inner:FindFirstChild("NameTagGui")
+                                    if gui and gui:FindFirstChild("PlayerTag") then
+                                        local key = tostring(inner.Address or inner)
+                                        alive[key] = true
 
-                                    if gui then
-                                        local tag = gui:FindFirstChild("PlayerTag")
+                                        if not gunTrackers[key] then
+                                            local tracker
+                                            local ok = pcall(function()
+                                                tracker = ESP.NewTracker(inner, "", Color3.fromRGB(255, 200, 0))
+                                            end)
 
-                                        if tag then
-                                            local key = tostring(inner)
-                                            aliveKeys[key] = true
-
-                                            if not trackers[key] then
-                                                local name = SHOW_NAME and (tag.Text or "Unknown") or ""
-                                                local tracker
-                                                
-                                                local success, err = pcall(function()
-                                                    tracker = ESP.NewTracker(inner, name, Color3.fromRGB(255, 200, 0))
+                                            if ok and tracker then
+                                                pcall(function()
+                                                    if tracker.Drawings then
+                                                        if tracker.Drawings.Name then
+                                                            local obj = tracker.Drawings.Name
+                                                            if type(obj) == "table" and obj.Drawing then obj.Drawing.Visible = false else obj.Visible = false end
+                                                        end
+                                                        if tracker.Drawings.Player then
+                                                            local obj = tracker.Drawings.Player
+                                                            if type(obj) == "table" and obj.Drawing then obj.Drawing.Visible = false else obj.Visible = false end
+                                                        end
+                                                    end
                                                 end)
 
-                                                if success and tracker then
-                                                    pcall(function()
-                                                        if tracker.Drawings then
-                                                            if tracker.Drawings.Name then
-                                                                if type(tracker.Drawings.Name) == "table" and tracker.Drawings.Name.Drawing then
-                                                                    tracker.Drawings.Name.Drawing.Visible = false
-                                                                else
-                                                                    tracker.Drawings.Name.Visible = false
-                                                                end
-                                                            end
-                                                            if tracker.Drawings.Player then
-                                                                if type(tracker.Drawings.Player) == "table" and tracker.Drawings.Player.Drawing then
-                                                                    tracker.Drawings.Player.Drawing.Visible = false
-                                                                else
-                                                                    tracker.Drawings.Player.Visible = false
-                                                                end
-                                                            end
-                                                        end
+                                                local target = pFolder
+                                                pcall(function()
+                                                    tracker:AddText("Gun", Color3.fromRGB(150, 220, 255), "", function()
+                                                        if not target or target.Parent == nil then return "" end
+                                                        local g = getGun(target)
+                                                        return (g == "Unknown") and "" or g
                                                     end)
+                                                end)
 
-                                                    pcall(function()
-                                                        tracker:AddText("Gun", Color3.fromRGB(150, 220, 255), "", function()
-                                                            local gun = getGun(playerFolder)
-
-                                                            if gun == "Unknown" then
-                                                                return ""
-                                                            end
-
-                                                            return gun
-                                                        end)
-                                                    end)
-
-                                                    trackers[key] = tracker
-                                                end
+                                                gunTrackers[key] = tracker
                                             end
                                         end
                                     end
@@ -391,10 +322,10 @@ visualSection:Toggle("Gun ESP", false, function(on)
                     end
                 end)
 
-                for key, tracker in next, trackers do
-                    if not aliveKeys[key] then
-                        pcall(function() tracker:Destroy() end)
-                        trackers[key] = nil
+                for k, tr in next, gunTrackers do
+                    if not alive[k] then
+                        pcall(function() tr:Destroy() end)
+                        gunTrackers[k] = nil
                     end
                 end
 
@@ -402,9 +333,9 @@ visualSection:Toggle("Gun ESP", false, function(on)
             end
         end)
     else
-        for key, tracker in next, trackers do
-            pcall(function() tracker:Destroy() end)
-            trackers[key] = nil
+        for k, tr in next, gunTrackers do
+            pcall(function() tr:Destroy() end)
+            gunTrackers[k] = nil
         end
         pcall(function()
             local ESP = _G.ESP_Utility or ESP_Utility
@@ -415,52 +346,77 @@ visualSection:Toggle("Gun ESP", false, function(on)
     end
 end)
 
--- Tag ESP Visual Configuration
 visualSection:Toggle("Tag ESP", false, function(on)
-    tagEspActive = on
+    tagEspOn = on
+    if tagEspThread then
+        pcall(task.cancel, tagEspThread)
+        tagEspThread = nil
+    end
     
     if on then
-        task.spawn(function()
-            local ESP = ensureEspUtilityLoaded()
+        tagEspThread = task.spawn(function()
+            local ESP = loadEsp()
             if not ESP then return end
             
-            while tagEspActive do
-                local aliveKeys = {}
+            while tagEspOn do
+                local alive = {}
                 
                 pcall(function()
-                    local ignoreFolder = nil
+                    local ignore = nil
                     pcall(function()
-                        ignoreFolder = game.i0jDS7MuY_U(workspace):FindFirstChild("Ignore")
+                        ignore = game.i0jDS7MuY_U(workspace):FindFirstChild("Ignore")
                     end)
-                    if not ignoreFolder then
-                        ignoreFolder = workspace:FindFirstChild("Ignore")
+                    if not ignore then
+                        ignore = workspace:FindFirstChild("Ignore")
                     end
                     
-                    local gunDrop = ignoreFolder and ignoreFolder:FindFirstChild("GunDrop")
-                    if gunDrop then
-                        for _, child in ipairs(gunDrop:GetChildren()) do
-                            if child.Name == "DogTag" then
-                                local tagPart = child:FindFirstChild("Tag")
-                                if tagPart and (tagPart.ClassName == "Part" or tagPart:IsA("BasePart")) then
-                                    local key = tostring(tagPart.Address or tagPart)
-                                    aliveKeys[key] = true
+                    if ignore then
+                        for _, container in ipairs(ignore:GetChildren()) do
+                            if container.Name == "GunDrop" or container.Name == "Misc" or container.Name == "Drop" then
+                                for _, child in ipairs(container:GetChildren()) do
+                                    if child.Name == "DogTag" then
+                                        local part = child:FindFirstChild("Tag") or child:FindFirstChildOfClass("BasePart")
+                                        if part and part:IsA("BasePart") then
+                                            local key = tostring(part.Address or part)
+                                            alive[key] = true
+                                            
+                                            if not tagTrackers[key] then
+                                                local tracker
+                                                local ok = pcall(function()
+                                                    tracker = ESP.NewTracker(part, "[Dog Tag]", Color3.fromRGB(255, 85, 85))
+                                                end)
+                                                
+                                                if ok and tracker then
+                                                    pcall(function()
+                                                        if tracker.Drawings and tracker.Drawings.Distance then
+                                                            local obj = tracker.Drawings.Distance
+                                                            if type(obj) == "table" and obj.Drawing then obj.Drawing.Visible = false else obj.Visible = false end
+                                                        end
+                                                    end)
+                                                    
+                                                    tagTrackers[key] = tracker
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            elseif container.Name == "DogTag" then
+                                local part = container:FindFirstChild("Tag") or container:FindFirstChildOfClass("BasePart")
+                                if part and part:IsA("BasePart") then
+                                    local key = tostring(part.Address or part)
+                                    alive[key] = true
                                     
                                     if not tagTrackers[key] then
                                         local tracker
-                                        local success, err = pcall(function()
-                                            tracker = ESP.NewTracker(tagPart, "[Dog Tag]", Color3.fromRGB(255, 85, 85))
+                                        local ok = pcall(function()
+                                            tracker = ESP.NewTracker(part, "[Dog Tag]", Color3.fromRGB(255, 85, 85))
                                         end)
                                         
-                                        if success and tracker then
+                                        if ok and tracker then
                                             pcall(function()
-                                                if tracker.Drawings then
-                                                    if tracker.Drawings.Distance then
-                                                        if type(tracker.Drawings.Distance) == "table" and tracker.Drawings.Distance.Drawing then
-                                                            tracker.Drawings.Distance.Drawing.Visible = false
-                                                        else
-                                                            tracker.Drawings.Distance.Visible = false
-                                                        end
-                                                    end
+                                                if tracker.Drawings and tracker.Drawings.Distance then
+                                                    local obj = tracker.Drawings.Distance
+                                                    if type(obj) == "table" and obj.Drawing then obj.Drawing.Visible = false else obj.Visible = false end
                                                 end
                                             end)
                                             
@@ -473,10 +429,10 @@ visualSection:Toggle("Tag ESP", false, function(on)
                     end
                 end)
                 
-                for key, tracker in pairs(tagTrackers) do
-                    if not aliveKeys[key] then
-                        pcall(function() tracker:Destroy() end)
-                        tagTrackers[key] = nil
+                for k, tr in pairs(tagTrackers) do
+                    if not alive[k] then
+                        pcall(function() tr:Destroy() end)
+                        tagTrackers[k] = nil
                     end
                 end
                 
@@ -484,28 +440,24 @@ visualSection:Toggle("Tag ESP", false, function(on)
             end
         end)
     else
-        for key, tracker in pairs(tagTrackers) do
-            pcall(function() tracker:Destroy() end)
-            tagTrackers[key] = nil
+        for k, tr in pairs(tagTrackers) do
+            pcall(function() tr:Destroy() end)
+            tagTrackers[k] = nil
         end
     end
 end)
 
--- Right Column: Weapon Mods settings
 local modsSection = miscTab:Section("Weapon mods", "Right")
 
 local pendingSway = false
 local pendingAimWalk = false
-local aimWalkValue = 1.0
+local aimWalkMult = 1.0
 local pendingNoRecoil = false
+local pendingInstantReload = false
 
--- --- No Recoil (One-time application) ---
 local containerKeys = { "nil" }
-local numberKeys = {
-"_firemodeStability", "hipfirespread", "aimfirespread"
-}
+local numberKeys = { "_firemodeStability", "hipfirespread", "aimfirespread" }
 
--- Recursively zero all number and Vector3 fields in a table
 local function zeroTable(t, depth)
     if type(t) ~= "table" then return end
     depth = depth or 4
@@ -523,18 +475,15 @@ local function zeroTable(t, depth)
     end
 end
 
--- Apply all no-recoil modifications once
-local function applyNoRecoilOnce()
+local function applyNoRecoil()
     task.spawn(function()
-        -- Zero top-level number fields one by one with delay
-        local numberCache = getgc(numberKeys)
-        for _, key in ipairs(numberKeys) do
-            pcall(applygc, numberCache, key, 0)
+        local numCache = getgc(numberKeys)
+        for _, k in ipairs(numberKeys) do
+            pcall(applygc, numCache, k, 0)
         end
 
-        -- Zero recoil / spring table contents with delay
-        local containerCache = getgc(containerKeys)
-        for _, entry in ipairs(containerCache) do
+        local cCache = getgc(containerKeys)
+        for _, entry in ipairs(cCache) do
             if entry and entry.type == "table" then
                 zeroTable(entry.value, 4)
             end
@@ -542,26 +491,13 @@ local function applyNoRecoilOnce()
     end)
 end
 
-modsSection:Toggle("Remove weapon sway", false, function(on)
-    pendingSway = on
-end)
+modsSection:Toggle("Remove weapon sway", false, function(v) pendingSway = v end)
+modsSection:Toggle("No recoil", false, function(v) pendingNoRecoil = v end)
+modsSection:Toggle("Instant reload", false, function(v) pendingInstantReload = v end)
+modsSection:Toggle("Aiming walk speed", false, function(v) pendingAimWalk = v end)
 
--- No Recoil toggle now only sets pending flag, does not apply immediately
-modsSection:Toggle("No recoil", false, function(on)
-    pendingNoRecoil = on
-end)
-
-modsSection:Toggle("Instant reload", false, function(on)
-    pendingInstantReload = on
-end)
-
-
-modsSection:Toggle("Aiming walk speed", false, function(on)
-    pendingAimWalk = on
-end)
-
-safeSlider(modsSection, "Aiming walk mult", aimWalkValue, 0.1, 1.0, 4.0, "x", function(val)
-    if val then aimWalkValue = val end
+addSlider(modsSection, "Aiming walk mult", aimWalkMult, 0.1, 1.0, 4.0, "x", function(v)
+    if v then aimWalkMult = v end
 end)
 
 modsSection:Button("Apply Mods", function()
@@ -571,7 +507,7 @@ modsSection:Button("Apply Mods", function()
     end
 
     if pendingNoRecoil then
-        applyNoRecoilOnce()
+        applyNoRecoil()
     end
 
     if pendingInstantReload then
@@ -582,10 +518,9 @@ modsSection:Button("Apply Mods", function()
     if pendingAimWalk then
         task.spawn(function()
             pcall(function()
-                local targetProperties = { "aimwalkspeedmult" }
-                local weaponGC = getgc(targetProperties)
-                if weaponGC then
-                    applygc(weaponGC, "aimwalkspeedmult", aimWalkValue)
+                local gc = getgc({ "aimwalkspeedmult" })
+                if gc then
+                    applygc(gc, "aimwalkspeedmult", aimWalkMult)
                 end
             end)
         end)
@@ -593,9 +528,8 @@ modsSection:Button("Apply Mods", function()
 
     Lib:Notify("Weapon Mods", "Weapon settings applied successfully", 2, "success")
 end)
--- Right Column: Crosshair Settings
-local crosshairSection = miscTab:Section("Crosshair", "Right")
 
+local crosshairSection = miscTab:Section("Crosshair", "Right")
 crosshairSection:Info("Note: You must rejoin the game to reset your crosshair.")
 
 crosshairSection:Button("Small Crosshair", function()
@@ -618,15 +552,12 @@ crosshairSection:Button("No Crosshair", function()
     Lib:Notify("Crosshair", "Crosshair disabled", 2, "success")
 end)
 
--- Add standard settings page
 win:AddSettingsTab("cog")
 
--- =====================================================================
--- 6. DRAWING MANAGER
--- =====================================================================
+local maxDrawings = 400
 local activeTracers = {}
 local drawings = {}
-local lastFrameDrawCount = 0
+local lastDrawCount = 0
 
 local function lerp(a, b, t) return a + (b - a) * t end
 local function lerpColor(c1, c2, t)
@@ -644,7 +575,7 @@ local function sampleColors(t)
     return lerpColor(cols[idx + 1], cols[idx + 2], scaled - idx)
 end
 
-local function hsvToColor(h, s, v)
+local function hsv(h, s, v)
     h = h % 1
     local i = math.floor(h * 6)
     local f = h * 6 - i
@@ -660,7 +591,8 @@ local function hsvToColor(h, s, v)
     return Color3.new(v, p, q)
 end
 
-local function gOC(idx)
+local function getLine(idx)
+    if idx > maxDrawings then return nil end
     if not drawings[idx] then
         local ok, d = pcall(Drawing.new, "Line")
         if ok and d then
@@ -672,212 +604,198 @@ local function gOC(idx)
     return drawings[idx]
 end
 
--- PRE-ALLOCATE OBJECT POOL
-local PRE_ALLOCATE_COUNT = 300
 task.spawn(function()
-    for i = 1, PRE_ALLOCATE_COUNT do
-        gOC(i)
-        if i % 15 == 0 then
-            task.wait()
-        end
+    for i = 1, 100 do
+        getLine(i)
+        if i % 25 == 0 then task.wait() end
     end
 end)
 
-local function registerTracer(startPos, endPos)
+local function addTracer(p1, p2)
+    if #activeTracers >= 20 then
+        table.remove(activeTracers, 1)
+    end
     table.insert(activeTracers, {
-        start = startPos,
-        target = endPos,
-        t = os.clock()
+        start = p1,
+        target = p2,
+        t = tick()
     })
 end
 
-local function renderTracers()
-    local now = os.clock()
+local function drawTracers()
+    local now = tick()
     local drawIdx = 0
 
     if not cfg.enabled then 
-        for idx = 1, lastFrameDrawCount do
-            local d = drawings[idx]
+        for i = 1, lastDrawCount do
+            local d = drawings[i]
             if d then d.Visible = false end
         end
-        lastFrameDrawCount = 0
+        lastDrawCount = 0
         return 
     end
 
-    local aliveTracers = {}
+    for i = #activeTracers, 1, -1 do
+        local tr = activeTracers[i]
+        if (now - tr.t) >= cfg.fadeTime then
+            table.remove(activeTracers, i)
+        end
+    end
+
     for tIdx = 1, #activeTracers do
-        local tracer = activeTracers[tIdx]
-        local age = now - tracer.t
+        local tr = activeTracers[tIdx]
+        local age = now - tr.t
         local alpha = math.max(0, 1 - age / cfg.fadeTime)
 
         if alpha > 0.01 then
-            table.insert(aliveTracers, tracer)
-
-            local dir, right, trueUp, lengthFactor, freqRatio = nil, nil, nil, 1.0, 1.0
-            local displacementVec = tracer.target - tracer.start
-            local magnitude = displacementVec.Magnitude
-            if magnitude > 0 then
-                dir = displacementVec / magnitude
+            local dir, right, trueUp, lenFactor, freqRatio = nil, nil, nil, 1.0, 1.0
+            local delta = tr.target - tr.start
+            local dist = delta.Magnitude
+            if dist > 0 then
+                dir = delta / dist
                 local up = math.abs(dir.Y) > 0.99 and Vector3.new(1, 0, 0) or Vector3.new(0, 1, 0)
                 right = dir:Cross(up).Unit
                 trueUp = right:Cross(dir).Unit
-                
-                lengthFactor = math.clamp(magnitude / 150, 0.05, 0.75)
-                freqRatio = math.clamp(magnitude / 250, 0.15, 1.6)
+                lenFactor = math.clamp(dist / 150, 0.05, 0.75)
+                freqRatio = math.clamp(dist / 250, 0.15, 1.6)
             end
 
-            local numSegments = cfg.segments or 5
+            local segments = cfg.segments or 5
             if cfg.trailType == "solid" then
-                numSegments = 1
+                segments = 1
             elseif cfg.trailType == "Rope kinda?" then
-                numSegments = math.max(numSegments, math.floor(15 * freqRatio))
-                numSegments = math.clamp(numSegments, 15, 45)
+                segments = math.clamp(math.floor(12 * freqRatio), 8, 24)
             end
 
-            local function getElectricOffset(t)
+            local function getOffset(t)
                 if not right or t <= 0 or t >= 1 then return Vector3.zero end
-                local envelope = math.sin(t * math.pi)
-                
+                local env = math.sin(t * math.pi)
                 local stretch = (1 - t * t * 0.65)
-                local angleX = t * (5 * freqRatio) * stretch - now * 10 + tIdx
-                local angleY = t * (11 * freqRatio) * stretch + now * 12 - tIdx
-                
-                local waveX = math.sin(angleX) * 1.5 + math.cos(angleX * 2.2) * 0.4
-                local waveY = math.cos(angleY) * 1.5 + math.sin(angleY * 2.2) * 0.4
-                    
-                local scale = (1.5 + cfg.thickness * 0.5) * envelope * lengthFactor
-                return right * (waveX * scale) + trueUp * (waveY * scale)
+                local ax = t * (5 * freqRatio) * stretch - now * 10 + tIdx
+                local ay = t * (11 * freqRatio) * stretch + now * 12 - tIdx
+                local wx = math.sin(ax) * 1.5 + math.cos(ax * 2.2) * 0.4
+                local wy = math.cos(ay) * 1.5 + math.sin(ay * 2.2) * 0.4
+                local scale = (1.5 + cfg.thickness * 0.5) * env * lenFactor
+                return right * (wx * scale) + trueUp * (wy * scale)
             end
 
-            for sIdx = 1, numSegments do
-                local t1 = (sIdx - 1) / numSegments
-                local t2 = sIdx / numSegments
+            for sIdx = 1, segments do
+                local t1 = (sIdx - 1) / segments
+                local t2 = sIdx / segments
 
-                local p1 = tracer.start:Lerp(tracer.target, t1)
-                local p2 = tracer.start:Lerp(tracer.target, t2)
+                local p1 = tr.start:Lerp(tr.target, t1)
+                local p2 = tr.start:Lerp(tr.target, t2)
 
                 if cfg.trailType == "Rope kinda?" then
-                    p1 = p1 + getElectricOffset(t1)
-                    p2 = p2 + getElectricOffset(t2)
+                    p1 = p1 + getOffset(t1)
+                    p2 = p2 + getOffset(t2)
                 end
 
-                local sp1, onScreen1 = MatchaWorldToScreen(p1)
-                local sp2, onScreen2 = MatchaWorldToScreen(p2)
+                local sp1, on1 = w2s(p1)
+                local sp2, on2 = w2s(p2)
 
-                -- Perform clip processing only when a segment passes from on-screen to off-screen
-                local drawSegment = false
-                local finalSP1, finalSP2
+                local canDraw = false
+                local fsp1, fsp2
 
-                if onScreen1 and onScreen2 then
-                    finalSP1 = Vector2.new(sp1.X, sp1.Y)
-                    finalSP2 = Vector2.new(sp2.X, sp2.Y)
-                    drawSegment = true
-                elseif onScreen1 and not onScreen2 then
-                    local clippedSP2 = getClippedPoint(p1, p2)
-                    if clippedSP2 then
-                        finalSP1 = Vector2.new(sp1.X, sp1.Y)
-                        finalSP2 = Vector2.new(clippedSP2.X, clippedSP2.Y)
-                        drawSegment = true
+                if on1 and on2 then
+                    fsp1 = Vector2.new(sp1.X, sp1.Y)
+                    fsp2 = Vector2.new(sp2.X, sp2.Y)
+                    canDraw = true
+                elseif on1 and not on2 then
+                    local cl = clipPoint(p1, p2)
+                    if cl then
+                        fsp1 = Vector2.new(sp1.X, sp1.Y)
+                        fsp2 = Vector2.new(cl.X, cl.Y)
+                        canDraw = true
                     end
-                elseif not onScreen1 and onScreen2 then
-                    local clippedSP1 = getClippedPoint(p2, p1)
-                    if clippedSP1 then
-                        finalSP1 = Vector2.new(clippedSP1.X, clippedSP1.Y)
-                        finalSP2 = Vector2.new(sp2.X, sp2.Y)
-                        drawSegment = true
+                elseif not on1 and on2 then
+                    local cl = clipPoint(p2, p1)
+                    if cl then
+                        fsp1 = Vector2.new(cl.X, cl.Y)
+                        fsp2 = Vector2.new(sp2.X, sp2.Y)
+                        canDraw = true
                     end
                 else
-                    -- Midpoint check: If both ends are off-screen but segment crosses screen center
                     local pMid = p1:Lerp(p2, 0.5)
-                    local spMid, onScreenMid = MatchaWorldToScreen(pMid)
-                    if onScreenMid then
-                        local clippedSP1 = getClippedPoint(pMid, p1)
-                        local clippedSP2 = getClippedPoint(pMid, p2)
-                        if clippedSP1 and clippedSP2 then
-                            finalSP1 = Vector2.new(clippedSP1.X, clippedSP1.Y)
-                            finalSP2 = Vector2.new(clippedSP2.X, clippedSP2.Y)
-                            drawSegment = true
+                    local spMid, onMid = w2s(pMid)
+                    if onMid then
+                        local cl1 = clipPoint(pMid, p1)
+                        local cl2 = clipPoint(pMid, p2)
+                        if cl1 and cl2 then
+                            fsp1 = Vector2.new(cl1.X, cl1.Y)
+                            fsp2 = Vector2.new(cl2.X, cl2.Y)
+                            canDraw = true
                         end
                     end
                 end
 
-                if drawSegment then
-                    local prevSP = finalSP1
-                    local curSP = finalSP2
-
+                if canDraw then
                     local tt = cfg.trailType
                     local col = sampleColors(t1)
-                    local thickness = cfg.thickness
+                    local th = cfg.thickness
                     local isNeon = tt == "neon"
                     local neonA
 
-                    if tt == "gradient" then
-                        col = sampleColors(t1)
-                    elseif tt == "pulse" then
-                        thickness = cfg.thickness * (1 + 0.4 * math.sin(now * 12 + tIdx + sIdx * 0.2))
+                    if tt == "pulse" then
+                        th = cfg.thickness * (1 + 0.4 * math.sin(now * 12 + tIdx + sIdx * 0.2))
                     elseif tt == "rainbow" then
-                        col = hsvToColor((now * 0.5 + t1 * 0.5) % 1, 0.85, 1)
+                        col = hsv((now * 0.5 + t1 * 0.5) % 1, 0.85, 1)
                     elseif tt == "flicker" then
-                        local aT = math.sin(now * 15 + t1 * math.pi) * 0.5 + 0.5
-                        col = sampleColors(aT)
+                        col = sampleColors(math.sin(now * 15 + t1 * math.pi) * 0.5 + 0.5)
                     elseif tt == "neon" then
-                        col = sampleColors(t1)
                         neonA = alpha * (0.85 + 0.15 * math.sin(now * 8 + tIdx * 0.5))
                     end
 
                     if tt == "Rope kinda?" then
-                        local fadeFactor = (1 - t1) * 0.9 + 0.1
-                        local elecAlpha = alpha * fadeFactor * (0.8 + 0.2 * math.sin(now * 25 + tIdx * 10 + sIdx))
-                        local elecThickness = cfg.thickness * fadeFactor
+                        local fade = (1 - t1) * 0.9 + 0.1
+                        local eAlpha = alpha * fade * (0.8 + 0.2 * math.sin(now * 25 + tIdx * 10 + sIdx))
+                        local eTh = cfg.thickness * fade
 
                         local layers = {
-                            { elecThickness * 14,  elecAlpha * 0.04 },
-                            { elecThickness * 7,   elecAlpha * 0.12 },
-                            { elecThickness * 3.5, elecAlpha * 0.32 },
-                            { elecThickness * 1.6, elecAlpha * 0.7  },
-                            { elecThickness * 0.6, elecAlpha        },
+                            { eTh * 4.5, eAlpha * 0.2 },
+                            { eTh * 1.8, eAlpha * 0.6 },
+                            { eTh * 0.7, eAlpha },
                         }
-                        for _, layer in ipairs(layers) do
+                        for _, l in ipairs(layers) do
                             drawIdx = drawIdx + 1
-                            local d = gOC(drawIdx)
+                            local d = getLine(drawIdx)
                             if d then
-                                d.From = prevSP
-                                d.To = curSP
+                                d.From = fsp1
+                                d.To = fsp2
                                 d.Color = col
-                                d.Thickness = layer[1]
-                                d.Transparency = layer[2]
+                                d.Thickness = l[1]
+                                d.Transparency = l[2]
                                 d.ZIndex = 5
                                 d.Visible = true
                             end
                         end
                     elseif isNeon then
-                        local neonLayers = {
-                            { cfg.thickness * 9,   neonA * 0.08 },
-                            { cfg.thickness * 4.5, neonA * 0.2  },
-                            { cfg.thickness * 1.8, neonA * 0.7  },
-                            { cfg.thickness * 0.7, neonA        },
+                        local layers = {
+                            { cfg.thickness * 4.5, neonA * 0.2 },
+                            { cfg.thickness * 1.8, neonA * 0.7 },
+                            { cfg.thickness * 0.7, neonA },
                         }
-                        for _, layer in ipairs(neonLayers) do
+                        for _, l in ipairs(layers) do
                             drawIdx = drawIdx + 1
-                            local d = gOC(drawIdx)
+                            local d = getLine(drawIdx)
                             if d then
-                                d.From = prevSP
-                                d.To = curSP
+                                d.From = fsp1
+                                d.To = fsp2
                                 d.Color = col
-                                d.Thickness = layer[1]
-                                d.Transparency = layer[2]
+                                d.Thickness = l[1]
+                                d.Transparency = l[2]
                                 d.ZIndex = 5
                                 d.Visible = true
                             end
                         end
                     else
                         drawIdx = drawIdx + 1
-                        local d = gOC(drawIdx)
+                        local d = getLine(drawIdx)
                         if d then
-                            d.From = prevSP
-                            d.To = curSP
+                            d.From = fsp1
+                            d.To = fsp2
                             d.Color = col
-                            d.Thickness = thickness
+                            d.Thickness = th
                             d.Transparency = alpha
                             d.ZIndex = 5
                             d.Visible = true
@@ -888,68 +806,43 @@ local function renderTracers()
         end
     end
     
-    for idx = drawIdx + 1, lastFrameDrawCount do
-        local d = drawings[idx]
-        if d then
-            d.Visible = false
-        end
+    for i = drawIdx + 1, lastDrawCount do
+        local d = drawings[i]
+        if d then d.Visible = false end
     end
-    lastFrameDrawCount = drawIdx
-
-    activeTracers = aliveTracers
+    lastDrawCount = drawIdx
 end
 
--- =====================================================================
--- 7. PHANTOM FORCES DATA PARSERS & BINDINGS
--- =====================================================================
-local function getIgnoreList()
-    local ignore = {}
-    if player.Character then
-        table.insert(ignore, player.Character)
-    end
-    
-    local cam = getActiveCamera()
-    if cam then
-        table.insert(ignore, cam)
-    end
-    
-    return ignore
+local function getIgnore()
+    local list = {}
+    if player.Character then table.insert(list, player.Character) end
+    local cam = getCamera()
+    if cam then table.insert(list, cam) end
+    return list
 end
 
--- Walk up parent hierarchy to detect if the part is part of the player's arms/hands
-local function isArmDescendant(instance)
-    local current = instance
-    while current and current ~= game do
-        local nameLower = current.Name:lower()
-        if string.find(nameLower, "arm") 
-           or string.find(nameLower, "sleeve") 
-           or string.find(nameLower, "skintone") 
-           or string.find(nameLower, "hand") then
+local function isArm(inst)
+    local cur = inst
+    while cur and cur ~= game do
+        local name = cur.Name:lower()
+        if name:find("arm") or name:find("sleeve") or name:find("skintone") or name:find("hand") then
             return true
         end
-        current = current.Parent
+        cur = cur.Parent
     end
     return false
 end
 
--- Highly targeted scanning limits searches directly inside Camera's Model subclasses
-local function findPFMuzzlePart()
-    local cam = getActiveCamera()
+local function getMuzzle()
+    local cam = getCamera()
     if not cam then return nil end
     
-    local children = cam:GetChildren()
-    for i = 1, #children do
-        local child = children[i]
+    for _, child in ipairs(cam:GetChildren()) do
         if child.ClassName == "Model" then
-            local modelDescendants = child:GetDescendants()
-            for j = 1, #modelDescendants do
-                local part = modelDescendants[j]
-                if part and BASE_PART_CLASSES[part.ClassName] then
-                    if not isArmDescendant(part) then
-                        local mesh = part:FindFirstChildOfClass("SpecialMesh")
-                        if mesh then
-                            return part
-                        end
+            for _, part in ipairs(child:GetDescendants()) do
+                if part and validParts[part.ClassName] and not isArm(part) then
+                    if part:FindFirstChildOfClass("SpecialMesh") then
+                        return part
                     end
                 end
             end
@@ -958,175 +851,156 @@ local function findPFMuzzlePart()
     return nil
 end
 
-local resolvedMuzzlePart = nil
+local currentMuzzle = nil
 local lastMuzzleScan = 0
 
--- Scan cache updates cleanly only when the current muzzle gets unparented, preventing scanning lag
-local function getOriginPart(character)
+local function getOrigin(char)
     local now = tick()
-    
-    if not resolvedMuzzlePart or resolvedMuzzlePart.Parent == nil or (now - lastMuzzleScan > 0.5) then
+    if not currentMuzzle or currentMuzzle.Parent == nil or (now - lastMuzzleScan > 0.5) then
         lastMuzzleScan = now
-        
-        local found = findPFMuzzlePart()
-        
-        if found then
-            resolvedMuzzlePart = found
-        else
-            local headPart = character and character:FindFirstChild("Head")
-            resolvedMuzzlePart = headPart
-        end
+        currentMuzzle = getMuzzle() or (char and char:FindFirstChild("Head"))
     end
-    
-    return resolvedMuzzlePart
+    return currentMuzzle
 end
 
--- Safe path traversal to locate active weapon ammo labels in PlayerGui
-local function getMagCountLabel()
+local function getAmmoLabel()
     if not player then return nil end
-    local playerGui = player:FindFirstChild("PlayerGui")
-    if not playerGui then return nil end
-    
-    local hudScreenGui = playerGui:FindFirstChild("HudScreenGui")
-    local main = hudScreenGui and hudScreenGui:FindFirstChild("Main")
-    local displayStatus = main and main:FindFirstChild("DisplayStatus")
-    local textMagCount = displayStatus and displayStatus:FindFirstChild("TextMagCount")
-    
-    return textMagCount
+    local gui = player:FindFirstChild("PlayerGui")
+    if not gui then return nil end
+    local hud = gui:FindFirstChild("HudScreenGui")
+    local main = hud and hud:FindFirstChild("Main")
+    local disp = main and main:FindFirstChild("DisplayStatus")
+    return disp and disp:FindFirstChild("TextMagCount")
 end
 
--- Trigger a safe raycast simulation and generate active lines using Roblox Native Raycast API
-local function triggerTracer()
-    local character = player.Character
-    local originPart = getOriginPart(character)
+local function shootTracer()
+    local char = player.Character
+    local origin = getOrigin(char)
     
-    if originPart then
-        local successPos, posVal = pcall(function() return originPart.Position end)
-        if not successPos or not posVal then
-            return
-        end
+    if origin and origin.Parent ~= nil then
+        local okPos, pos = pcall(function() return origin.Position end)
+        if not okPos or not pos then return end
         
-        local origin = posVal
-        local maxRange = 1000
-        
+        local maxDist = 1000
         local cf
-        local successCF, cfVal = pcall(function() return originPart.CFrame end)
-        if successCF and cfVal then
+        local okCF, cfVal = pcall(function() return origin.CFrame end)
+        if okCF and cfVal then
             cf = cfVal
         else
-            cf = CFrame.new(origin)
+            cf = CFrame.new(pos)
         end
         
-        local direction = Vector3.new(0, 0, -maxRange)
+        local dir = Vector3.new(0, 0, -maxDist)
         if cf then
-            local successMuzzleLook, muzzleLookVal = pcall(function() return cf.LookVector end)
-            if successMuzzleLook and muzzleLookVal then
-                direction = muzzleLookVal * maxRange
+            local okLook, look = pcall(function() return cf.LookVector end)
+            if okLook and look then
+                dir = look * maxDist
             end
         end
         
-        local ignoreList = getIgnoreList()
-        local params = RaycastParams.new()
-        params.FilterType = Enum.RaycastFilterType.Exclude
-        params.FilterDescendantsInstances = ignoreList
-        params.IgnoreWater = true
+        local target = pos + dir
+        pcall(function()
+            local params = RaycastParams.new()
+            params.FilterType = Enum.RaycastFilterType.Exclude
+            params.FilterDescendantsInstances = getIgnore()
+            params.IgnoreWater = true
+            local res = workspace:Raycast(pos, dir, params)
+            if res then
+                target = res.Position
+            end
+        end)
         
-        local result = workspace:Raycast(origin, direction, params)
-        
-        local targetPosition
-        if result then
-            targetPosition = result.Position
-        else
-            targetPosition = origin + direction
-        end
-        
-        registerTracer(origin, targetPosition)
+        addTracer(pos, target)
     end
 end
 
--- =====================================================================
--- INITIALIZATION WORKER
--- =====================================================================
--- Continuous background scanner for muzzle identification (runs on 0.5s interval with targeted viewmodel model queries)
-local backgroundScanner = task.spawn(function()
+local scannerThread = task.spawn(function()
     while true do
-        local character = player.Character
-        getOriginPart(character)
+        getOrigin(player.Character)
         task.wait(0.5)
     end
 end)
 
--- =====================================================================
--- 8. DYNAMIC SHOOTING LOOP
--- =====================================================================
-local function handleTracerAndInputs()
-    camera = getActiveCamera()
+local function onStep()
+    camera = getCamera()
+    drawTracers()
 
-    renderTracers()
-
-    if not isrbxactive() then 
-        return 
-    end
+    if not isrbxactive() then return end
     
-    local magLabel = getMagCountLabel()
-    if magLabel then
-        local rawText = magLabel.Text
-        if rawText then
-            local cleanText = rawText:gsub("%s+", "")
-            local currentAmmo = tonumber(cleanText)
-            
-            if currentAmmo then
-                if lastAmmoValue and currentAmmo < lastAmmoValue then
-                    triggerTracer()
-                end
-                lastAmmoValue = currentAmmo
-            else
-                lastAmmoValue = nil
+    local lbl = getAmmoLabel()
+    if lbl and lbl.Text then
+        local clean = (lbl.Text:gsub("%s+", ""))
+        local val = tonumber(clean)
+        if val then
+            if lastAmmo and val < lastAmmo then
+                shootTracer()
             end
+            lastAmmo = val
+        else
+            lastAmmo = nil
         end
     else
-        lastAmmoValue = nil
+        lastAmmo = nil
     end
 end
 
-local connection = RunService.RenderStepped:Connect(handleTracerAndInputs)
+local renderConn = RunService.RenderStepped:Connect(onStep)
 
--- =====================================================================
--- REGISTRATION OF CLEANUP HOOK
--- =====================================================================
 _G.MatchaTracerCleanup = function()
-    if connection then connection:Disconnect() end
-    if backgroundScanner then pcall(task.cancel, backgroundScanner) end
+    if renderConn then 
+        pcall(function() renderConn:Disconnect() end)
+        renderConn = nil
+    end
     
-    gunEspActive = false
-    tagEspActive = false
+    if scannerThread then 
+        pcall(task.cancel, scannerThread) 
+        scannerThread = nil
+    end
     
-    if trackers then
-        for key, tracker in next, trackers do
-            pcall(function() tracker:Destroy() end)
+    gunEspOn = false
+    if gunEspThread then
+        pcall(task.cancel, gunEspThread)
+        gunEspThread = nil
+    end
+    
+    tagEspOn = false
+    if tagEspThread then
+        pcall(task.cancel, tagEspThread)
+        tagEspThread = nil
+    end
+    
+    if gunTrackers then
+        for _, tr in next, gunTrackers do
+            pcall(function() tr:Destroy() end)
         end
-        table.clear(trackers)
+        table.clear(gunTrackers)
     end
     
     if tagTrackers then
-        for key, tracker in pairs(tagTrackers) do
-            pcall(function() tracker:Destroy() end)
+        for _, tr in pairs(tagTrackers) do
+            pcall(function() tr:Destroy() end)
         end
         table.clear(tagTrackers)
     end
+    
+    local ESP = _G.ESP_Utility or ESP_Utility
+    if ESP and ESP.TrackersToUpdate then
+        pcall(table.clear, ESP.TrackersToUpdate)
+    end
+    
+    table.clear(gunCache)
+    table.clear(lastCacheTime)
+    currentMuzzle = nil
     
     if _G.MatchaTracerWindow then
         pcall(function() _G.MatchaTracerWindow:Destroy() end)
         _G.MatchaTracerWindow = nil
     end
 
-    for i = 1, #drawings do
-        local d = drawings[i]
-        if d then 
-            pcall(function() d:Remove() end)
-        end
+    for _, d in pairs(drawings) do
+        if d then pcall(function() d:Remove() end) end
     end
     table.clear(drawings)
     table.clear(activeTracers)
-    lastFrameDrawCount = 0
+    lastDrawCount = 0
 end
